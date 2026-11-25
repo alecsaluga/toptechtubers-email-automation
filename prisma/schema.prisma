@@ -1,0 +1,238 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x", "debian-openssl-3.0.x"]
+}
+
+enum SenderKind {
+  EXACT
+  DOMAIN
+}
+
+enum SenderCategory {
+  GOOD_OPP
+  IMP
+  AGENCY
+  AUTOCLOSE
+}
+
+enum Assignee {
+  LAWRENCE
+  LILY
+  PATRICK
+  NIKITA
+  KATHY
+  MIA
+  VANESSA
+  UNASSIGNED
+}
+
+enum Phase {
+  SHADOW
+  LIVE
+}
+
+// A sender rule from the routing waterfall. The SAME value can appear in more
+// than one category on purpose -- that's a real conflict in the source n8n
+// workflow (e.g. dealingagency.com is listed as both AGENCY and AUTOCLOSE).
+// The waterfall's priority order (see src/lib/router/waterfall.ts) decides
+// the winner; the list manager UI surfaces these as conflicts to resolve.
+model Sender {
+  id        String         @id @default(cuid())
+  value     String
+  kind      SenderKind
+  category  SenderCategory
+  assignee  Assignee       @default(UNASSIGNED)
+  notes     String?
+  source    String         @default("manual")
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@unique([value, kind, category])
+  @@index([value])
+  @@index([category])
+}
+
+model Creator {
+  id          String         @id @default(cuid())
+  name        String         @unique
+  // Not unique: source data has occasional slug collisions/blanks and
+  // slug is display-only, not a lookup key.
+  slug        String?
+  channelUrl  String?
+  niche       String?
+  country     String?
+  assignee    Assignee       @default(UNASSIGNED)
+  ccRules     String?
+  emails      CreatorEmail[]
+  rateCard    RateCard?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model CreatorEmail {
+  id        String  @id @default(cuid())
+  email     String  @unique
+  creatorId String
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([creatorId])
+}
+
+// One row per creator. Field names replace the source workflow's col_N /
+// mixed-key sheet lookups.
+model RateCard {
+  id        String  @id @default(cuid())
+  creatorId String  @unique
+  creator   Creator @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  youtubeSubs     Int?
+  dedicatedPrice  Decimal?
+  midRoll60Price  Decimal?
+  midRoll120Price Decimal?
+
+  tiktokFollowers    Int?
+  instagramFollowers Int?
+  xFollowers         Int?
+  threadsFollowers   Int?
+  facebookFollowers  Int?
+
+  oneCrossPostPrice  Decimal?
+  threePlatformPrice Decimal?
+  allPlatformPrice   Decimal?
+
+  // Per-creator override for the reply body, e.g. for creators whose main
+  // channel isn't YouTube (blog, newsletter). Supports {{variableName}}
+  // placeholders -- see TEMPLATE_VAR_KEYS in src/lib/reply-builder/rateCardTemplate.ts.
+  // Null/blank falls back to the default bullet-point template.
+  customTemplate String?
+
+  updatedAt DateTime @updatedAt
+}
+
+enum ReviewStatus {
+  PENDING
+  GOOD
+  BAD
+}
+
+model ReplyLog {
+  id             String       @id @default(cuid())
+  gmailMessageId String?      @unique // dedupe key for real Gmail polling; null if a row is ever created another way
+  inboundFrom    String
+  inboundTo      String?
+  subject        String?
+  route          String
+  finalCategory  String
+  creatorName    String?
+  renderedHtml   String?
+  ccPreview      String?
+  status         String
+  reason         String?
+  createdAt      DateTime     @default(now())
+
+  // QA review for staged (not-yet-live) replies -- see /staging. Applies to any entry, but only shown/
+  // editable in the UI for the reply-eligible categories under review.
+  reviewStatus ReviewStatus @default(PENDING)
+  reviewNotes  String?
+  reviewedAt   DateTime?
+
+  @@index([finalCategory])
+  @@index([status])
+  @@index([reviewStatus])
+}
+
+// A Gmail label ID from the n8n export. None of these have human-readable
+// names in the source data -- `name` stays null until an admin sets it.
+model Label {
+  id            String   @id @default(cuid())
+  gmailId       String   @unique
+  name          String?
+  isPlaceholder Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  entityType String
+  entityId   String
+  action     String
+  changedBy  String   @default("system")
+  diff       String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+// A connected Gmail account for real ingestion. Only one is expected in
+// practice (the shared TTT inbox), but this isn't enforced -- id is the PK.
+model GoogleAccount {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  accessToken    String
+  refreshToken   String
+  tokenExpiresAt DateTime
+  scope          String
+  lastPolledAt   DateTime?
+  connectedAt    DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
+
+enum PathwayKey {
+  GOOD_OPPORTUNITY
+  IMP_OUTREACH
+  AGENCY_MARKUP
+  NOISE_SPAM
+}
+
+// Per-outcome "is this pathway allowed to take a real action on a real
+// inbound email" switch -- separate from the global shadow/live AppSetting,
+// which only gates the mock Test Inbox pipeline. GOOD_OPPORTUNITY /
+// IMP_OUTREACH / AGENCY_MARKUP all mean "send a real rate-card reply";
+// NOISE_SPAM means "apply a label only" (see the
+// Command Center UI for the full explanation). All default to inactive --
+// an admin must explicitly turn each one on.
+model PathwayConfig {
+  key       PathwayKey @id
+  live      Boolean    @default(false)
+  updatedAt DateTime   @updatedAt
+}
+
+// Client-editable credentials (Google OAuth Client ID/Secret, future API
+// keys) entered via the Command Center UI instead of Vercel env vars, so a
+// non-technical client can self-serve without a redeploy. `valueEncrypted`
+// is AES-256-GCM ciphertext (see src/lib/crypto.ts) -- never store or return
+// plaintext. ENCRYPTION_KEY (env var, infra-managed only) is required to
+// read/write these.
+model Secret {
+  key            String   @id
+  valueEncrypted String
+  updatedAt      DateTime @updatedAt
+}
+
+// Mirror of the "DO NOT EDIT" tab of the Master Content Calendar sheet.
+// Replaced wholesale on each sync (src/lib/creators/syncContentCalendar.ts).
+model ContentCalendarEntry {
+  id                String   @id @default(cuid())
+  creatorId         String?
+  channelName       String
+  status            String?
+  videoTitle        String?
+  launchMonth       String?
+  launchTiming      String?
+  exactLaunchDate   String?
+  niche             String?
+  sponsorType       String?
+  sponsorInfo       String?
+  similarVideoLink  String?
+  similarVideoViews String?
+  rowIndex          Int
+  syncedAt          DateTime @default(now())
+
+  @@index([creatorId])
+}
